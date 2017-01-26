@@ -17,11 +17,24 @@ from haystack.exceptions import NotHandled
 from haystack.query import SearchQuerySet
 from haystack.utils.app_loading import haystack_get_models, haystack_load_apps
 
+from ssc import *
+
 DEFAULT_BATCH_SIZE = None
 DEFAULT_AGE = None
 DEFAULT_MAX_RETRIES = 5
 
 LOG = multiprocessing.log_to_stderr(level=logging.WARNING)
+
+def do_update_batch(backend, index, iteritems, start, batch_size, total, verbosity=1):
+    if verbosity >= 2:
+        if hasattr(os, 'getppid') and os.getpid() == os.getppid():
+            print("  indexing %s - %d of %d." % (start + 1, start+batch_size, total))
+        else:
+            print("  indexing %s - %d of %d (by %s)." % (start + 1, start+batch_size, total, os.getpid()))
+
+    batch = list(islice(iteritems,batch_size))
+    backend.update(index, batch)
+    return len(batch)
 
 
 def update_worker(args):
@@ -249,15 +262,15 @@ class Command(BaseCommand):
             if self.workers > 0:
                 ghetto_queue = []
 
-            for start in range(0, total, batch_size):
-                end = min(start + batch_size, total)
-
-                if self.workers == 0:
-                    do_update(backend, index, qs, start, end, total, verbosity=self.verbosity,
-                              commit=self.commit, max_retries=self.max_retries)
-                else:
-                    ghetto_queue.append((model, start, end, total, using, self.start_date, self.end_date,
-                                         self.verbosity, self.commit, self.max_retries))
+            else:
+                with server_side_cursors(qs, itersize=batch_size):
+                    items = qs.iterator()  # prevents filling query-cache
+                    while True:
+                        added = do_update_batch(backend, index, items, start, batch_size, total, self.verbosity)
+                        if added > 0:
+                            start += added
+                            continue
+                        break
 
             if self.workers > 0:
                 pool = multiprocessing.Pool(self.workers)
